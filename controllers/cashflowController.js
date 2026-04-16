@@ -1,84 +1,92 @@
 // =============================================================================
-// FICHIER : controllers/cashflowController.js (CORRIGÉ FINAL)
+// FICHIER : controllers/cashflowController.js
 // Description : Génération du rapport de flux de trésorerie SYSCOHADA SMT.
-// CORRECTION : Migration vers odooExecuteKw (JSON-RPC) avec UID Admin.
+// Version : V2 — Corrections appliquées
+//   ✅ ADMIN_UID converti en entier (parseInt)
+//   ✅ 'sort' remplacé par 'order' (paramètre correct odooExecuteKw)
+//   ✅ Image parasite supprimée
+//   ✅ Vérification ADMIN_UID via ADMIN_UID_INT (cohérence avec les autres controllers)
 // =============================================================================
 
-const { odooExecuteKw } = require('../services/odooService'); // Import du service JSON-RPC stable
-const ADMIN_UID = process.env.ODOO_ADMIN_UID; // UID Admin pour les requêtes privilégiées
+const { odooExecuteKw, ADMIN_UID_INT } = require('../services/odooService');
 
 exports.getMonthlyCashflowSMT = async (req, res) => {
-    try {
-        const { analyticId } = req.params; // L'identifiant de la compagnie (compte analytique)
-        // L'UID de l'utilisateur connecté (nécessaire pour le contexte, même si nous utilisons l'UID Admin pour l'exécution)
-        const { odooUid } = req.user; 
-        // const password = req.headers['x-odoo-password']; // ⬅️ SUPPRIMÉ : Utilisation de la Clé API Admin dans odooService.js
+    try {
+        const { analyticId } = req.params;
 
-        if (!ADMIN_UID) {
-             return res.status(500).json({ error: "Erreur de configuration: ODOO_ADMIN_UID est manquant. Vérifiez vos variables d'environnement." });
+        // ✅ Utilise ADMIN_UID_INT (déjà parsé en entier dans odooService.js)
+        if (!ADMIN_UID_INT || isNaN(ADMIN_UID_INT)) {
+            return res.status(500).json({
+                success: false,
+                error: 'Configuration manquante: ODOO_ADMIN_UID invalide.'
+            });
         }
 
-        // 1. Définition de la période (12 derniers mois)
-        const dateLimit = new Date();
-        dateLimit.setFullYear(dateLimit.getFullYear() - 1);
-        const dateString = dateLimit.toISOString().split('T')[0];
+        // 1. Période : 12 derniers mois
+        const dateLimit = new Date();
+        dateLimit.setFullYear(dateLimit.getFullYear() - 1);
+        const dateString = dateLimit.toISOString().split('T')[0];
 
-        // 2. Requête Odoo : On cible les comptes de trésorerie (Classe 5) avec filtre analytique
-        // Utilisation de odooExecuteKw avec l'UID Admin
-        const moves = await odooExecuteKw({
-            uid: ADMIN_UID, // ⬅️ UID Admin pour la lecture des données (Access Control List)
-            model: 'account.move.line',
+        // 2. Requête Odoo — Comptes de trésorerie (Classe 5) avec filtre analytique
+        const moves = await odooExecuteKw({
+            uid:    ADMIN_UID_INT,
+            model:  'account.move.line',
             method: 'search_read',
-            args: [
-                [
-                    // Le filtre d'isolation analytique
-                    ['analytic_distribution', 'in', [analyticId.toString()]], 
-                    ['account_id.code', '=like', '5%'], // Uniquement la Classe 5 (Trésorerie)
-                    ['date', '>=', dateString],
-                    ['parent_state', '=', 'posted'] // Seulement les écritures validées
-                ]
-            ], 
-            kwargs: { 
-                fields: ['date', 'debit', 'credit', 'name'],
-                sort: 'date asc'
-            }
+            args: [[
+                ['analytic_distribution', 'in', [analyticId.toString()]],
+                ['account_id.code',       '=like', '5%'],
+                ['date',                  '>=',    dateString],
+                ['parent_state',          '=',     'posted'],
+            ]],
+            kwargs: {
+                fields: ['date', 'debit', 'credit', 'name'],
+                order:  'date asc', // ✅ 'order' et non 'sort'
+            }
         });
 
+        // 3. Agrégation par mois (SYSCOHADA SMT)
+        const monthlyData = {};
 
-        // 3. Agrégation par mois (Logique SYSCOHADA SMT)
-        const monthlyData = {};
+        moves.forEach(move => {
+            const monthKey = move.date.substring(0, 7); // "YYYY-MM"
 
-        moves.forEach(move => {
-            const monthKey = move.date.substring(0, 7); // Format "YYYY-MM"
-            if (!monthlyData[monthKey]) {
-                monthlyData[monthKey] = { mois: monthKey, entrees: 0, sorties: 0, solde: 0 };
-            }
+            if (!monthlyData[monthKey]) {
+                monthlyData[monthKey] = {
+                    mois:    monthKey,
+                    entrees: 0,
+                    sorties: 0,
+                    solde:   0,
+                };
+            }
 
-            // En Classe 5 : Débit = Entrée d'argent, Crédit = Sortie d'argent
-            monthlyData[monthKey].entrees += move.debit;
-            monthlyData[monthKey].sorties += move.credit;
-            monthlyData[monthKey].solde += (move.debit - move.credit);
-        });
-
-        // Convertir l'objet en tableau trié pour le frontend
-        const report = Object.values(monthlyData);
-        // 
-
-[Image of cash flow chart]
-
-        
-        res.json({
-            entrepriseId: analyticId,
-            referentiel: "SYSCOHADA SMT (Trésorerie)",
-            unite: "XOF",
-            fluxMensuels: report
-        });
-
-    } catch (error) {
-        console.error('[Cashflow SMT Error]', error.message);
-        res.status(500).json({ 
-            error: error.message,
-            message: 'Erreur lors de la récupération des flux de trésorerie. Vérifiez la connexion Odoo et les droits analytiques.' 
+            // Classe 5 : Débit = Entrée, Crédit = Sortie
+            monthlyData[monthKey].entrees += move.debit  || 0;
+            monthlyData[monthKey].sorties += move.credit || 0;
+            monthlyData[monthKey].solde   += (move.debit || 0) - (move.credit || 0);
         });
-    }
+
+        // 4. Trier par mois (ordre chronologique)
+        const report = Object.values(monthlyData)
+            .sort((a, b) => a.mois.localeCompare(b.mois));
+
+        res.status(200).json({
+            success:      true,
+            entrepriseId: analyticId,
+            referentiel:  'SYSCOHADA SMT (Trésorerie)',
+            unite:        'XOF',
+            periode:      {
+                debut: dateString,
+                fin:   new Date().toISOString().split('T')[0],
+            },
+            fluxMensuels: report,
+        });
+
+    } catch (error) {
+        console.error('🚨 [Cashflow SMT Error]', error.message);
+        res.status(500).json({
+            success: false,
+            error:   error.message,
+            message: 'Erreur lors de la récupération des flux de trésorerie.',
+        });
+    }
 };
